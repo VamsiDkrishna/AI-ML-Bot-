@@ -1081,16 +1081,34 @@ function recordLeave(userId, eventTs, leave) {
   formatLeaveSheet(sheet);
 
   // Only explicit approval requests trigger Approve / Reject buttons.
+  // The leave rows must remain recorded even if the Slack approval DM fails.
   if (
     rowsCreated > 0 &&
     leave.approval_requested_from
   ) {
-    sendLeaveApprovalRequest(
-      requestId,
-      userId,
-      employeeName,
-      leave
-    );
+    try {
+      sendLeaveApprovalRequest(
+        requestId,
+        userId,
+        employeeName,
+        leave
+      );
+    } catch (error) {
+      console.error(
+        'Leave approval notification error: ' + error.message
+      );
+
+      try {
+        sendSlackMessageToUser(
+          userId,
+          '⚠️ Your leave request was recorded, but I could not send the approval notification to the approver. Please contact HR/admin and share Request ID: ' + requestId
+        );
+      } catch (notifyError) {
+        console.error(
+          'Leave failure notification error: ' + notifyError.message
+        );
+      }
+    }
   }
 
   return rowsCreated;
@@ -2780,73 +2798,104 @@ function repairLegacyLeaveRows(sheet) {
 
   const headers = values[0];
 
-  // Only repair rows in the current 10-column schema that still contain
-  // the old 7-column layout starting in column A.
-  if (headers.indexOf('Leave Request ID') !== 0) {
+  if (
+    headers.indexOf('Leave Request ID') !== 0 ||
+    headers.indexOf('Leave Date') !== 1 ||
+    headers.indexOf('Employee') !== 2 ||
+    headers.indexOf('Slack User ID') !== 3 ||
+    headers.indexOf('Status') !== 9
+  ) {
     return;
   }
+
+  const validStatuses = {
+    'Pending Approval': true,
+    'Approved': true,
+    'Rejected': true
+  };
 
   for (let i = 1; i < values.length; i++) {
     const row = values[i];
 
-    const a = row[0];
-    const b = row[1];
-    const c = String(row[2] || '').trim();
-    const d = row[3];
-    const j = String(row[9] || '').trim();
+    const requestId = String(row[0] || '').trim();
+    const leaveDate = row[1];
+    const employee = String(row[2] || '').trim();
+    const slackUserId = String(row[3] || '').trim();
+    const reason = String(row[4] || '').trim();
+    const status = String(row[9] || '').trim();
 
-    // Old row pattern:
-    // A = Leave Date
-    // B = Employee
-    // C = Slack User ID
-    // D = Reason
-    // E = Informed To (possibly blank)
-    // F = Submitted At
-    // G = Status
-    // New row has request ID in A and Status in J.
-    const looksLegacy =
-      !String(a || '').startsWith('LR-') &&
-      /^[UW][A-Z0-9]+$/.test(c) &&
-      !!b &&
-      !!d &&
-      !j;
-
-    if (!looksLegacy) {
+    if (!requestId && !employee && !slackUserId) {
       continue;
     }
 
-    const legacyDate = a;
-    const legacyEmployee = b;
-    const legacySlackId = c;
-    const legacyReason = d;
-    const legacyInformedTo = row[4] || '';
-    const legacySubmittedAt = row[5] || '';
-    const legacyStatus =
-      String(row[6] || 'Pending Approval').trim() ||
-      'Pending Approval';
+    // Repair the older 8-column Leaves layout when it was copied into
+    // the current 10-column sheet. In that layout:
+    // A=Leave Request/Date, B=Employee, C=Slack ID, D=Reason,
+    // E=Informed To, F=Approved By, G=Submitted At, H=Status.
+    const looksOldEightColumnRow =
+      !requestId.startsWith('LR-') &&
+      !!employee &&
+      /^[UW][A-Z0-9]+$/.test(slackUserId);
 
-    const requestId =
-      'LR-LEGACY-' +
-      Utilities.getUuid().substring(0, 8);
+    if (looksOldEightColumnRow) {
+      const oldRequestId =
+        'LR-LEGACY-' +
+        Utilities.getUuid().substring(0, 8);
 
-    const newRow = [
-      requestId,
-      parseDateValue(legacyDate),
-      legacyEmployee,
-      legacySlackId,
-      legacyReason,
-      legacyInformedTo,
-      '',
-      '',
-      parseDateTimeValue(legacySubmittedAt),
-      legacyStatus
-    ];
+      const oldApprovedBy = String(row[5] || '').trim();
+      const oldSubmittedAt = row[6] || '';
+      const oldStatus =
+        String(row[7] || 'Pending Approval').trim() ||
+        'Pending Approval';
 
-    sheet.getRange(i + 1, 1, 1, 10)
-      .setValues([newRow]);
+      sheet.getRange(i + 1, 1, 1, 10).setValues([[
+        oldRequestId,
+        parseDateValue(leaveDate),
+        employee,
+        slackUserId,
+        reason,
+        row[4] || '',
+        '',
+        oldApprovedBy,
+        parseDateTimeValue(oldSubmittedAt),
+        validStatuses[oldStatus] ? oldStatus : 'Pending Approval'
+      ]]);
+
+      continue;
+    }
+
+    // Repair rows that already have an LR-/LR-LEGACY request ID but whose
+    // submitted timestamp was accidentally written into Status.
+    if (
+      requestId.startsWith('LR-') &&
+      !validStatuses[status]
+    ) {
+      const possibleSubmittedAt = row[9];
+
+      if (
+        possibleSubmittedAt &&
+        isDateLike(possibleSubmittedAt)
+      ) {
+        sheet.getRange(i + 1, 9).setValue(
+          parseDateTimeValue(possibleSubmittedAt)
+        );
+      }
+
+      sheet.getRange(i + 1, 10).setValue(
+        'Pending Approval'
+      );
+    }
   }
 }
 
+function isDateLike(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return true;
+  }
+
+  const parsed = new Date(String(value || ''));
+  return !isNaN(parsed.getTime());
+}
 
 /***********************
  * FORMATTING
