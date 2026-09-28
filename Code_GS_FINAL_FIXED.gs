@@ -67,6 +67,7 @@ const EXCLUDED_ATTENDANCE_USER_IDS = [
 
 const MESSAGE_CACHE_SECONDS = 21600;
 const REPORT_CACHE_SECONDS = 86400;
+const REPORT_WINDOW_MINUTES = 60;
 
 
 /***********************
@@ -84,9 +85,15 @@ function doPost(e) {
       const queueKey =
         'SLACK_INTERACTION_' + Utilities.getUuid();
 
-      PropertiesService
-        .getScriptProperties()
-        .setProperty(queueKey, JSON.stringify(payload));
+      const queueLock = LockService.getScriptLock();
+      queueLock.waitLock(5000);
+      try {
+        PropertiesService
+          .getScriptProperties()
+          .setProperty(queueKey, JSON.stringify(payload));
+      } finally {
+        queueLock.releaseLock();
+      }
 
       return ContentService
         .createTextOutput('OK')
@@ -307,11 +314,17 @@ function handleUserMessage(
   // Natural-language leave request.
   else if (looksLikeLeaveRequest(normalized)) {
 
-    const leave = extractLeaveWithAI(
-      text,
-      userId,
-      eventTs
-    );
+    let leave;
+    try {
+      leave = extractLeaveWithAI(text, userId, eventTs);
+    } catch (error) {
+      console.error('Leave extraction error: ' + error.message);
+      sendSlackMessage(
+        channelId,
+        '⚠️ I could not process your leave request right now. Please try again in a few minutes. If the problem continues, contact HR/admin.'
+      );
+      return true;
+    }
 
     if (!leave || !leave.is_leave_request) {
       sendSlackMessage(
@@ -421,6 +434,18 @@ function sendAttendanceConfirmation(channel, text) {
  ***********************/
 
 function recordAttendance(userId, type, slackTs, replyChannel) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+    return recordAttendanceUnlocked(userId, type, slackTs, replyChannel);
+  } finally {
+    try { lock.releaseLock(); } catch (error) {
+      console.error('Attendance lock release error: ' + error.message);
+    }
+  }
+}
+
+function recordAttendanceUnlocked(userId, type, slackTs, replyChannel) {
 
   const sheet = getOrCreateAttendanceSheet();
   const employeeName = getEmployeeDisplayName(userId);
@@ -575,6 +600,8 @@ function recordAttendance(userId, type, slackTs, replyChannel) {
     );
   }
 }
+
+
 
 
 /***********************
@@ -1412,27 +1439,27 @@ function approverNameMatches(name, requested) {
  ***********************/
 
 function processQueuedSlackInteractions() {
-  const props = PropertiesService.getScriptProperties();
-  const all = props.getProperties();
-
-  Object.keys(all).forEach(function(key) {
-    if (key.indexOf('SLACK_INTERACTION_') !== 0) {
-      return;
-    }
-
-    try {
-      const payload = JSON.parse(all[key]);
-      handleSlackInteraction(payload);
-      props.deleteProperty(key);
-
-    } catch (error) {
-      console.error(
-        'Queued Slack interaction error: ' +
-          error.message
-      );
-      // Keep the item queued for another minute if processing fails.
-    }
-  });
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    console.warn('Another execution is processing Slack interactions.');
+    return;
+  }
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const all = props.getProperties();
+    Object.keys(all).forEach(function(key) {
+      if (key.indexOf('SLACK_INTERACTION_') !== 0) return;
+      try {
+        const payload = JSON.parse(all[key]);
+        handleSlackInteraction(payload);
+        props.deleteProperty(key);
+      } catch (error) {
+        console.error('Queued Slack interaction error: ' + error.message);
+      }
+    });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function handleSlackInteraction(payload) {
@@ -2256,79 +2283,38 @@ function installSummaryTrigger() {
 }
 
 function runScheduledReports() {
-  // Approval interactions are processed from the queue first.
   processQueuedSlackInteractions();
-
   const now = new Date();
 
-  // Daily automatic sync at 5:55 AM.
-  if (isWithinScheduledWindow(now, 5, 55, 15)) {
-    runOncePerDay(
-      'DAILY_SYNC',
-      now,
-      function() {
-        syncEmployeesFromSlack();
-        syncApproversFromSlack();
-      }
-    );
+  if (isWithinScheduledWindow(now, 5, 55, REPORT_WINDOW_MINUTES)) {
+    runOncePerDay('DAILY_SYNC', now, function() {
+      syncEmployeesFromSlack();
+      syncApproversFromSlack();
+    });
   }
 
-  // 7:00 AM current morning presence.
-  if (isWithinScheduledWindow(now, 7, 0, 15)) {
-    sendReportOnce(
-      'MORNING_CHECKIN',
-      getWorkDateForMorning(now),
-      function() {
-        return buildCurrentPresentReport(
-          MORNING_SHIFT,
-          getWorkDateForMorning(now),
-          '7:00 AM'
-        );
-      }
-    );
+  if (isWithinScheduledWindow(now, 7, 0, REPORT_WINDOW_MINUTES)) {
+    sendReportOnce('MORNING_CHECKIN', getWorkDateForMorning(now), function() {
+      return buildCurrentPresentReport(MORNING_SHIFT, getWorkDateForMorning(now), '7:00 AM');
+    });
   }
 
-  // 3:45 PM morning final.
-  if (isWithinScheduledWindow(now, 15, 45, 15)) {
-    sendReportOnce(
-      'MORNING_FINAL',
-      getWorkDateForMorning(now),
-      function() {
-        return buildFinalShiftReport(
-          MORNING_SHIFT,
-          getWorkDateForMorning(now)
-        );
-      }
-    );
+  if (isWithinScheduledWindow(now, 15, 45, REPORT_WINDOW_MINUTES)) {
+    sendReportOnce('MORNING_FINAL', getWorkDateForMorning(now), function() {
+      return buildFinalShiftReport(MORNING_SHIFT, getWorkDateForMorning(now));
+    });
   }
 
-  // 4:00 PM evening current presence.
-  if (isWithinScheduledWindow(now, 16, 0, 15)) {
-    sendReportOnce(
-      'EVENING_CHECKIN',
-      getWorkDateForEvening(now),
-      function() {
-        return buildCurrentPresentReport(
-          EVENING_SHIFT,
-          getWorkDateForEvening(now),
-          '4:00 PM'
-        );
-      }
-    );
+  if (isWithinScheduledWindow(now, 16, 0, REPORT_WINDOW_MINUTES)) {
+    sendReportOnce('EVENING_CHECKIN', getWorkDateForEvening(now), function() {
+      return buildCurrentPresentReport(EVENING_SHIFT, getWorkDateForEvening(now), '4:00 PM');
+    });
   }
 
-  // 12:30 AM evening final for previous work date.
-  if (isWithinScheduledWindow(now, 0, 30, 15)) {
-    sendReportOnce(
-      'EVENING_FINAL',
-      getPreviousWorkDate(now),
-      function() {
-        return buildFinalShiftReport(
-          EVENING_SHIFT,
-          getPreviousWorkDate(now)
-        );
-      }
-    );
+  if (isWithinScheduledWindow(now, 0, 30, REPORT_WINDOW_MINUTES)) {
+    sendReportOnce('EVENING_FINAL', getPreviousWorkDate(now), function() {
+      return buildFinalShiftReport(EVENING_SHIFT, getPreviousWorkDate(now));
+    });
   }
 }
 
@@ -2360,38 +2346,32 @@ function isWithinScheduledWindow(
 
 function runOncePerDay(key, date, callback) {
   const dateString = formatDate(date);
-  const cache = CacheService.getScriptCache();
-  const cacheKey = 'DAILY_' + key + '_' + dateString;
-
-  if (cache.get(cacheKey)) {
-    return;
-  }
-
+  const props = PropertiesService.getScriptProperties();
+  const propertyKey = 'DAILY_DONE_' + key + '_' + dateString;
+  if (props.getProperty(propertyKey)) return;
   callback();
-  cache.put(cacheKey, '1', REPORT_CACHE_SECONDS);
+  props.setProperty(propertyKey, new Date().toISOString());
 }
 
 function sendReportOnce(reportType, workDate, builder) {
   const dateString = formatDate(workDate);
-  const cache = CacheService.getScriptCache();
+  const props = PropertiesService.getScriptProperties();
+  const key = 'REPORT_SENT_' + reportType + '_' + dateString;
+  const lock = LockService.getScriptLock();
 
-  const key =
-    'REPORT_' + reportType + '_' + dateString;
-
-  if (cache.get(key)) {
+  if (!lock.tryLock(5000)) {
+    console.warn('Report already being processed: ' + key);
     return;
   }
 
-  const message = builder();
-
-  // Mark only after Slack accepts the post.
-  sendSlackMessage(CHANNEL_ID, message);
-
-  cache.put(
-    key,
-    '1',
-    REPORT_CACHE_SECONDS
-  );
+  try {
+    if (props.getProperty(key)) return;
+    const message = builder();
+    sendSlackMessage(CHANNEL_ID, message);
+    props.setProperty(key, new Date().toISOString());
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function buildCurrentPresentReport(
@@ -2607,19 +2587,12 @@ function getAttendanceForDate(dateString) {
   const result = {};
 
   for (let i = 1; i < values.length; i++) {
-    const rowDate = formatDate(values[i][0]);
-
-    if (rowDate !== dateString) {
-      continue;
-    }
+    if (formatDate(values[i][0]) !== dateString) continue;
 
     const userId = String(values[i][2] || '').trim();
+    if (!userId) continue;
 
-    if (!userId) {
-      continue;
-    }
-
-    result[userId] = {
+    const candidate = {
       employee: values[i][1],
       userId: userId,
       shift: values[i][3],
@@ -2628,6 +2601,20 @@ function getAttendanceForDate(dateString) {
       total: values[i][6],
       status: values[i][7]
     };
+
+    const existing = result[userId];
+    if (!existing) {
+      result[userId] = candidate;
+      continue;
+    }
+
+    const existingScore = (existing.login ? 1 : 0) + (existing.logout ? 1 : 0);
+    const candidateScore = (candidate.login ? 1 : 0) + (candidate.logout ? 1 : 0);
+
+    if (candidateScore > existingScore ||
+        (candidateScore === existingScore && candidate.logout)) {
+      result[userId] = candidate;
+    }
   }
 
   return result;
