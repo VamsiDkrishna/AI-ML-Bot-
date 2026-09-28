@@ -807,6 +807,18 @@ function looksLikeLeaveRequest(text) {
   });
 }
 
+function isAttendanceQuery(text) {
+  return [
+    'present',
+    'my attendance',
+    'my attendance today',
+    'attendance',
+    'attendance today'
+  ].some(function(word) {
+    return text === word || text.indexOf(word) !== -1;
+  });
+}
+
 function isLeaveQuery(text) {
   return [
     'my leave',
