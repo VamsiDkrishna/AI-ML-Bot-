@@ -453,12 +453,16 @@ function recordAttendanceUnlocked(userId, type, slackTs, replyChannel) {
   const workDate = getAttendanceWorkDate(timestamp, type);
   const dateString = formatDate(workDate);
 
-  const assignedShift = getEmployeeAssignedShift(userId);
-  let shift = assignedShift;
+  // Assigned Shift in the Employees sheet (Column C) is the
+  // single source of truth. Never infer a shift from Slack login time.
+  const shift = getEmployeeAssignedShift(userId);
 
-  // Only use login/logout time as fallback when no assigned shift exists.
   if (!shift) {
-    shift = getShiftFromLoginTime(timestamp);
+    sendAttendanceConfirmation(
+      replyChannel || CHANNEL_ID,
+      '⚠️ Your attendance could not be recorded because no Assigned Shift is configured in the Employees sheet. Please ask the admin to set your shift.'
+    );
+    return;
   }
 
   /***********************
@@ -483,14 +487,10 @@ function recordAttendanceUnlocked(userId, type, slackTs, replyChannel) {
         return;
       }
 
-      // Existing logout-only row: fill login without changing the row's shift
-      // if a shift has already been recorded there.
+      // Existing logout-only row: fill login using the employee's
+      // assigned shift from the Employees sheet.
       sheet.getRange(existing.row, 5).setValue(timestamp);
-
-      if (!existing.shift) {
-        sheet.getRange(existing.row, 4).setValue(shift);
-      }
-
+      sheet.getRange(existing.row, 4).setValue(shift);
       sheet.getRange(existing.row, 8).setValue('Logged In');
       formatAttendanceSheet(sheet);
 
@@ -542,11 +542,12 @@ function recordAttendanceUnlocked(userId, type, slackTs, replyChannel) {
 
     if (!existing) {
       // Logout without login: do not invent a login time.
+      // The shift still comes from Employees!C.
       sheet.appendRow([
         workDate,
         employeeName,
         userId,
-        shift || '',
+        shift,
         '',
         timestamp,
         '',
@@ -632,15 +633,9 @@ function normalizeShift(value) {
 }
 
 function getShiftFromLoginTime(date) {
-  const hour = Number(
-    Utilities.formatDate(date, TIMEZONE, 'H')
-  );
-
-  if (hour >= 6 && hour < 15) {
-    return MORNING_SHIFT;
-  }
-
-  return EVENING_SHIFT;
+  // Deprecated: shift must come from Employees!C.
+  // Kept only for backward compatibility with old test calls.
+  return '';
 }
 
 function getEmployeeAssignedShift(userId) {
