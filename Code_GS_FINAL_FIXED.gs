@@ -190,6 +190,14 @@ function doPost(e) {
       }
     }
 
+    console.log(
+      'SLACK EVENT: type=' + event.type +
+      ', user=' + (event.user || '') +
+      ', channel=' + (event.channel || '') +
+      ', text=' + (event.text || '') +
+      ', processed=' + processed
+    );
+
     if (eventId && processed) {
       markProcessed(eventId);
     }
@@ -198,7 +206,8 @@ function doPost(e) {
 
   } catch (error) {
     console.error(
-      'doPost error: ' + error.message
+      'doPost error: ' + error.message +
+      '\nstack=' + (error.stack || '')
     );
 
     // Always acknowledge Slack.
@@ -278,19 +287,45 @@ function handleUserMessage(
 
   // Login.
   else if (isLoginMessage(normalized)) {
-    // Management / unassigned users are excluded from attendance,
-    // but their leave requests remain enabled.
+    console.log(
+      'ATTENDANCE LOGIN EVENT: userId=' + userId +
+      ', channel=' + channelId +
+      ', employee=' + getEmployeeDisplayName(userId) +
+      ', assignedShift=' + getEmployeeAssignedShift(userId) +
+      ', attendanceEmployee=' + isAttendanceEmployee(userId)
+    );
+
     if (isAttendanceEmployee(userId)) {
       recordAttendance(userId, 'LOGIN', eventTs, channelId);
+    } else {
+      sendSlackMessage(
+        channelId,
+        '⚠️ I received your Logged in, but your Slack account is not configured for attendance. Please ask the admin to verify your Slack User ID, Active, and Attendance Tracking in the Employees sheet.'
+      );
     }
+
     processed = true;
   }
 
   // Logout.
   else if (isLogoutMessage(normalized)) {
+    console.log(
+      'ATTENDANCE LOGOUT EVENT: userId=' + userId +
+      ', channel=' + channelId +
+      ', employee=' + getEmployeeDisplayName(userId) +
+      ', assignedShift=' + getEmployeeAssignedShift(userId) +
+      ', attendanceEmployee=' + isAttendanceEmployee(userId)
+    );
+
     if (isAttendanceEmployee(userId)) {
       recordAttendance(userId, 'LOGOUT', eventTs, channelId);
+    } else {
+      sendSlackMessage(
+        channelId,
+        '⚠️ I received your Logged out, but your Slack account is not configured for attendance. Please ask the admin to verify your Slack User ID, Active, and Attendance Tracking in the Employees sheet.'
+      );
     }
+
     processed = true;
   }
 
